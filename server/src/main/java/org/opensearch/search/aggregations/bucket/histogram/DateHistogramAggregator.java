@@ -31,6 +31,8 @@
 
 package org.opensearch.search.aggregations.bucket.histogram;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.*;
 import org.apache.lucene.internal.hppc.LongIntHashMap;
 import org.apache.lucene.search.DocIdStream;
@@ -89,6 +91,8 @@ import static org.opensearch.search.startree.StarTreeQueryHelper.getSupportedSta
  * @opensearch.internal
  */
 class DateHistogramAggregator extends BucketsAggregator implements SizedBucketAggregator, StarTreePreComputeCollector {
+    private static final Logger logger = LogManager.getLogger(DateHistogramAggregator.class);
+
     private final ValuesSource.Numeric valuesSource;
     private final DocValueFormat formatter;
     private final Rounding rounding;
@@ -212,17 +216,20 @@ class DateHistogramAggregator extends BucketsAggregator implements SizedBucketAg
 
         DocValuesSkipper skipper = null;
         if (this.fieldName != null) {
-            ctx.reader().getDocValuesSkipper(this.fieldName);
+            skipper = ctx.reader().getDocValuesSkipper(this.fieldName);
+            logger.warn("AGG: found skipper for {}:{}", this.fieldName, skipper);
         }
         final SortedNumericDocValues values = valuesSource.longValues(ctx);
         final NumericDocValues singleton = DocValues.unwrapSingleton(values);
 
         // If no subaggregations, we can use skip list based collector
-        if (sub == null && skipper != null) {
+        if ((sub == null || sub == LeafBucketCollector.NO_OP_COLLECTOR) && skipper != null) {
+            logger.warn("AGG: using HistogramLeafCollector");
             return new HistogramLeafCollector(singleton, skipper, preparedRounding, bucketOrds, this::incrementBucketDocCount);
         }
 
         if (singleton != null) {
+            logger.warn("AGG: using single valued leave collector");
             // Optimized path for single-valued fields
             return new LeafBucketCollectorBase(sub, values) {
                 @Override
