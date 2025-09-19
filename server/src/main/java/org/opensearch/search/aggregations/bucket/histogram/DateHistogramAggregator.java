@@ -34,9 +34,7 @@ package org.opensearch.search.aggregations.bucket.histogram;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.*;
-import org.apache.lucene.internal.hppc.LongIntHashMap;
 import org.apache.lucene.search.DocIdStream;
-import org.apache.lucene.search.LeafCollector;
 import org.apache.lucene.search.Scorable;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.util.CollectionUtil;
@@ -223,9 +221,9 @@ class DateHistogramAggregator extends BucketsAggregator implements SizedBucketAg
         final NumericDocValues singleton = DocValues.unwrapSingleton(values);
 
         // If no subaggregations, we can use skip list based collector
-        if ((sub == null || sub == LeafBucketCollector.NO_OP_COLLECTOR) && skipper != null) {
-            logger.warn("AGG: using HistogramLeafCollector");
-            return new HistogramLeafCollector(singleton, skipper, preparedRounding, bucketOrds, this::incrementBucketDocCount);
+        //TODO: add hard bounds support
+        if ((hardBounds != null || sub == null || sub == LeafBucketCollector.NO_OP_COLLECTOR) && skipper != null) {
+            return new HistogramSkiplistLeafCollector(singleton, skipper, preparedRounding, bucketOrds, this::incrementBucketDocCount);
         }
 
         if (singleton != null) {
@@ -415,7 +413,7 @@ class DateHistogramAggregator extends BucketsAggregator implements SizedBucketAg
         }
     }
 
-    private static class HistogramLeafCollector extends LeafBucketCollector {
+    private static class HistogramSkiplistLeafCollector extends LeafBucketCollector {
 
         private final NumericDocValues values;
         private final DocValuesSkipper skipper;
@@ -438,7 +436,7 @@ class DateHistogramAggregator extends BucketsAggregator implements SizedBucketAg
          */
         private long upToBucketIndex;
 
-        HistogramLeafCollector(
+        HistogramSkiplistLeafCollector(
             NumericDocValues values,
             DocValuesSkipper skipper,
             Rounding.Prepared preparedRounding,
@@ -505,7 +503,11 @@ class DateHistogramAggregator extends BucketsAggregator implements SizedBucketAg
                 incrementDocCount.accept(upToBucketIndex, 1L);
             } else if (values.advanceExact(doc)) {
                 final long value = values.longValue();
-                bucketOrds.add(0, preparedRounding.round(value));
+                long bucketIndex = bucketOrds.add(0, preparedRounding.round(value));
+                if (bucketIndex < 0) {
+                    bucketIndex = -1 - bucketIndex;
+                }
+                incrementDocCount.accept(bucketIndex, 1L);
             }
         }
 
