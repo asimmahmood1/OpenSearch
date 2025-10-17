@@ -50,6 +50,7 @@ import org.opensearch.common.TriFunction;
 import org.opensearch.common.geo.ShapeRelation;
 import org.opensearch.common.logging.DeprecationLogger;
 import org.opensearch.common.lucene.BytesRefs;
+import org.opensearch.common.recycler.Recycler;
 import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.time.DateFormatters;
 import org.opensearch.common.time.DateMathParser;
@@ -863,14 +864,15 @@ public final class DateFieldMapper extends ParametrizedFieldMapper {
     }
 
     boolean isSkiplistDefaultEnabled(IndexSortConfig indexSortConfig, String fieldName) {
-        if (!isSkiplistConfigured) {
-            if (indexSortConfig.hasPrimarySortOnField(fieldName)) {
-                return true;
+        if (this.indexCreatedVersion.onOrAfter(Version.V_3_3_0)) {
+            if (!isSkiplistConfigured) {
+                if (indexSortConfig.hasPrimarySortOnField(fieldName)) {
+                    return true;
+                }
+                if (DataStreamFieldMapper.Defaults.TIMESTAMP_FIELD.getName().equals(fieldName)) {
+                    return true;
+                }
             }
-            if (DataStreamFieldMapper.Defaults.TIMESTAMP_FIELD.getName().equals(fieldName)) {
-                return true;
-            }
-
         }
         return false;
     }
