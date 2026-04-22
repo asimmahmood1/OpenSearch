@@ -634,4 +634,79 @@ public class CardinalityAggregatorTests extends AggregatorTestCase {
             assertTrue(AggregationInspectionHelper.hasValue(card));
         }, collector -> { assertTrue(collector instanceof CardinalityAggregator.OrdinalsCollector); }, fieldType);
     }
+
+    public void testOrdinalsCollectorBulkCollectSingleValued() throws IOException {
+        MappedFieldType fieldType = new KeywordFieldMapper.KeywordFieldType("field");
+        final CardinalityAggregationBuilder aggregationBuilder = new CardinalityAggregationBuilder("_name").field("field")
+            .executionHint("ordinals");
+
+        int numDocs = 5000; // enough to exceed one DocIdStream batch (4096)
+        Set<String> uniqueValues = new HashSet<>();
+
+        try (Directory directory = newDirectory()) {
+            RandomIndexWriter indexWriter = new RandomIndexWriter(random(), directory);
+            for (int i = 0; i < numDocs; i++) {
+                String value = "val_" + (i % 200);
+                uniqueValues.add(value);
+                indexWriter.addDocument(singleton(new SortedDocValuesField("field", new BytesRef(value))));
+            }
+            indexWriter.close();
+
+            try (IndexReader indexReader = DirectoryReader.open(directory)) {
+                IndexSearcher indexSearcher = newSearcher(indexReader, true, true);
+
+                CardinalityAggregator aggregator = (CardinalityAggregator) createAggregator(
+                    aggregationBuilder,
+                    indexSearcher,
+                    fieldType
+                );
+                aggregator.preCollection();
+                indexSearcher.search(new MatchAllDocsQuery(), aggregator);
+                aggregator.postCollection();
+
+                InternalCardinality card = (InternalCardinality) aggregator.buildTopLevel();
+                // HLL is approximate, allow some tolerance
+                assertEquals(uniqueValues.size(), card.getValue(), uniqueValues.size() * 0.1);
+            }
+        }
+    }
+
+    public void testOrdinalsCollectorBulkCollectMultiValued() throws IOException {
+        MappedFieldType fieldType = new KeywordFieldMapper.KeywordFieldType("field");
+        final CardinalityAggregationBuilder aggregationBuilder = new CardinalityAggregationBuilder("_name").field("field")
+            .executionHint("ordinals");
+
+        int numDocs = 5000;
+        Set<String> uniqueValues = new HashSet<>();
+
+        try (Directory directory = newDirectory()) {
+            RandomIndexWriter indexWriter = new RandomIndexWriter(random(), directory);
+            for (int i = 0; i < numDocs; i++) {
+                String val1 = "val_" + (i % 150);
+                String val2 = "val_" + ((i + 1) % 150);
+                uniqueValues.add(val1);
+                uniqueValues.add(val2);
+                indexWriter.addDocument(
+                    asList(new SortedSetDocValuesField("field", new BytesRef(val1)), new SortedSetDocValuesField("field", new BytesRef(val2)))
+                );
+            }
+            indexWriter.close();
+
+            try (IndexReader indexReader = DirectoryReader.open(directory)) {
+                IndexSearcher indexSearcher = newSearcher(indexReader, true, true);
+
+                CardinalityAggregator aggregator = (CardinalityAggregator) createAggregator(
+                    aggregationBuilder,
+                    indexSearcher,
+                    fieldType
+                );
+                aggregator.preCollection();
+                indexSearcher.search(new MatchAllDocsQuery(), aggregator);
+                aggregator.postCollection();
+
+                InternalCardinality card = (InternalCardinality) aggregator.buildTopLevel();
+                assertEquals(uniqueValues.size(), card.getValue(), uniqueValues.size() * 0.1);
+            }
+        }
+    }
 }

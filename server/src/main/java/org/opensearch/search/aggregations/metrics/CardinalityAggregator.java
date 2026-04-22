@@ -34,7 +34,9 @@ package org.opensearch.search.aggregations.metrics;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.index.Term;
@@ -44,6 +46,7 @@ import org.apache.lucene.search.CollectionTerminatedException;
 import org.apache.lucene.search.DisiPriorityQueue;
 import org.apache.lucene.search.DisiWrapper;
 import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.DocIdStream;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.TermQuery;
@@ -551,6 +554,7 @@ public class CardinalityAggregator extends NumericMetricsAggregator.SingleValue 
     static class OrdinalsCollector extends Collector {
 
         private static final long SHALLOW_FIXEDBITSET_SIZE = RamUsageEstimator.shallowSizeOfInstance(FixedBitSet.class);
+        private static final int BATCH_SIZE = 4096;
 
         /**
          * Return an approximate memory overhead per bucket for this collector.
@@ -561,9 +565,12 @@ public class CardinalityAggregator extends NumericMetricsAggregator.SingleValue 
 
         private final BigArrays bigArrays;
         private final SortedSetDocValues values;
+        private final SortedDocValues singleValues;
         private final int maxOrd;
         private final HyperLogLogPlusPlus counts;
         private ObjectArray<BitArray> visitedOrds;
+        private final int[] docBuffer;
+        private final int[] ordBuffer;
 
         OrdinalsCollector(HyperLogLogPlusPlus counts, SortedSetDocValues values, BigArrays bigArrays) {
             if (values.getValueCount() > Integer.MAX_VALUE) {
@@ -573,6 +580,9 @@ public class CardinalityAggregator extends NumericMetricsAggregator.SingleValue 
             this.bigArrays = bigArrays;
             this.counts = counts;
             this.values = values;
+            this.singleValues = DocValues.unwrapSingleton(values);
+            this.docBuffer = new int[BATCH_SIZE];
+            this.ordBuffer = (singleValues != null) ? new int[BATCH_SIZE] : null;
             visitedOrds = bigArrays.newObjectArray(1);
         }
 
@@ -590,6 +600,49 @@ public class CardinalityAggregator extends NumericMetricsAggregator.SingleValue 
                 while ((count-- > 0) && (ord = values.nextOrd()) != SortedSetDocValues.NO_MORE_DOCS) {
                     bits.set((int) ord);
                 }
+            }
+        }
+
+        @Override
+        public void collect(DocIdStream stream, long bucketOrd) throws IOException {
+            visitedOrds = bigArrays.grow(visitedOrds, bucketOrd + 1);
+            BitArray bits = visitedOrds.get(bucketOrd);
+            if (bits == null) {
+                bits = new BitArray(maxOrd, bigArrays);
+                visitedOrds.set(bucketOrd, bits);
+            }
+            if (singleValues != null) {
+                collectSingleValued(stream, bits);
+            } else {
+                collectMultiValued(stream, bits);
+            }
+        }
+
+        private void collectSingleValued(DocIdStream stream, BitArray bits) throws IOException {
+            for (int count = stream.intoArray(docBuffer); count > 0; count = stream.intoArray(docBuffer)) {
+                singleValues.ordValues(count, docBuffer, ordBuffer, -1);
+                for (int i = 0; i < count; i++) {
+                    if (ordBuffer[i] != -1) {
+                        bits.set(ordBuffer[i]);
+                    }
+                }
+                if (stream.mayHaveRemaining() == false) break;
+            }
+        }
+
+        private void collectMultiValued(DocIdStream stream, BitArray bits) throws IOException {
+            for (int count = stream.intoArray(docBuffer); count > 0; count = stream.intoArray(docBuffer)) {
+                values.prefetchOrds(docBuffer, count);
+                for (int i = 0; i < count; i++) {
+                    if (values.advanceExact(docBuffer[i])) {
+                        int docValueCount = values.docValueCount();
+                        long ord;
+                        while ((docValueCount-- > 0) && (ord = values.nextOrd()) != SortedSetDocValues.NO_MORE_DOCS) {
+                            bits.set((int) ord);
+                        }
+                    }
+                }
+                if (stream.mayHaveRemaining() == false) break;
             }
         }
 
