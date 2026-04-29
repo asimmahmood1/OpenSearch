@@ -76,7 +76,7 @@ public class StreamCardinalityAggregator extends CardinalityAggregator implement
             streamCollector = new EmptyCollector();
         } else {
             ordinalsCollectorsUsed++;
-            streamCollector = new OrdinalsCollector(counts, ordinalValues, context.bigArrays());
+            streamCollector = new OrdinalsCollector(counts, ordinalValues, context.bigArrays(), context.cardinalityPrefetchPipeline());
         }
         return streamCollector;
     }

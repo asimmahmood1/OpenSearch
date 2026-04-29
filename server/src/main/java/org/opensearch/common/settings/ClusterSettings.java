@@ -575,6 +575,7 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 SearchService.SEARCH_MAX_QUERY_STRING_LENGTH,
                 SearchService.CARDINALITY_AGGREGATION_PRUNING_THRESHOLD,
                 SearchService.KEYWORD_INDEX_OR_DOC_VALUES_ENABLED,
+                SearchService.CARDINALITY_PREFETCH_PIPELINE,
                 CreatePitController.PIT_INIT_KEEP_ALIVE,
                 Node.WRITE_PORTS_FILE_SETTING,
                 Node.NODE_NAME_SETTING,

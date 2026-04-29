@@ -402,6 +402,13 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         Property.NodeScope
     );
 
+    public static final Setting<Boolean> CARDINALITY_PREFETCH_PIPELINE = Setting.boolSetting(
+        "search.cardinality_prefetch_pipeline",
+        false,
+        Property.Dynamic,
+        Property.NodeScope
+    );
+
     public static final int DEFAULT_BUCKET_SELECTION_STRATEGY_FACTOR = 5;
     public static final Setting<Integer> BUCKET_SELECTION_STRATEGY_FACTOR_SETTING = Setting.intSetting(
         "search.aggregation.bucket_selection_strategy_factor",
