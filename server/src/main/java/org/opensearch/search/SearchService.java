@@ -281,7 +281,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
 
     public static final Setting<Boolean> QUERY_REWRITING_ENABLED_SETTING = Setting.boolSetting(
         "search.query_rewriting.enabled",
-        false,
+        true,
         Property.Dynamic,
         Property.NodeScope
     );
@@ -397,6 +397,13 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
 
     public static final Setting<Boolean> KEYWORD_INDEX_OR_DOC_VALUES_ENABLED = Setting.boolSetting(
         "search.keyword_index_or_doc_values_enabled",
+        false,
+        Property.Dynamic,
+        Property.NodeScope
+    );
+
+    public static final Setting<Boolean> CARDINALITY_PREFETCH_PIPELINE = Setting.boolSetting(
+        "search.cardinality_prefetch_pipeline",
         false,
         Property.Dynamic,
         Property.NodeScope
