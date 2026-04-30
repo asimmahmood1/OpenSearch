@@ -266,6 +266,8 @@ public class GlobalOrdinalsStringTermsAggregator extends AbstractStringTermsAggr
                  * common and marginally faster.
                  */
                 return resultStrategy.wrapCollector(new LeafBucketCollectorBase(sub, globalOrds) {
+                    final int[] buffer = new int[4096];
+
                     @Override
                     public void collect(int doc, long owningBucketOrd) throws IOException {
                         if (false == singleValues.advanceExact(doc)) {
@@ -273,6 +275,15 @@ public class GlobalOrdinalsStringTermsAggregator extends AbstractStringTermsAggr
                         }
                         int globalOrd = singleValues.ordValue();
                         collectionStrategy.collectGlobalOrd(owningBucketOrd, doc, globalOrd, sub);
+                    }
+
+                    @Override
+                    public void collect(DocIdStream stream, long owningBucketOrd) throws IOException {
+                        int count = stream.intoArray(buffer);
+                        singleValues.prefetchOrdValues(count, buffer);
+                        for (int i = 0; i < count; i++) {
+                            collect(buffer[i], owningBucketOrd);
+                        }
                     }
                 });
             }
@@ -553,6 +564,8 @@ public class GlobalOrdinalsStringTermsAggregator extends AbstractStringTermsAggr
             if (singleValues != null) {
                 segmentsWithSingleValuedOrds++;
                 return resultStrategy.wrapCollector(new LeafBucketCollectorBase(sub, segmentOrds) {
+                    final int[] buffer = new int[4096];
+
                     @Override
                     public void collect(int doc, long owningBucketOrd) throws IOException {
                         assert owningBucketOrd == 0;
@@ -566,7 +579,11 @@ public class GlobalOrdinalsStringTermsAggregator extends AbstractStringTermsAggr
 
                     @Override
                     public void collect(DocIdStream stream, long owningBucketOrd) throws IOException {
-                        super.collect(stream, owningBucketOrd);
+                        int count = stream.intoArray(buffer);
+                        singleValues.prefetchOrdValues(count, buffer);
+                        for (int i = 0; i < count; i++) {
+                            collect(buffer[i], owningBucketOrd);
+                        }
                     }
                 });
             }
