@@ -266,7 +266,7 @@ public class GlobalOrdinalsStringTermsAggregator extends AbstractStringTermsAggr
                  * common and marginally faster.
                  */
                 return resultStrategy.wrapCollector(new LeafBucketCollectorBase(sub, globalOrds) {
-                    final int[] buffer = new int[4096];
+                    final int[] buffer = context.cardinalityPrefetchPipeline() ? new int[4096] : null;
 
                     @Override
                     public void collect(int doc, long owningBucketOrd) throws IOException {
@@ -279,6 +279,10 @@ public class GlobalOrdinalsStringTermsAggregator extends AbstractStringTermsAggr
 
                     @Override
                     public void collect(DocIdStream stream, long owningBucketOrd) throws IOException {
+                        if (buffer == null) {
+                            super.collect(stream, owningBucketOrd);
+                            return;
+                        }
                         int count = stream.intoArray(buffer);
                         singleValues.prefetchOrdValues(count, buffer);
                         for (int i = 0; i < count; i++) {
@@ -564,7 +568,7 @@ public class GlobalOrdinalsStringTermsAggregator extends AbstractStringTermsAggr
             if (singleValues != null) {
                 segmentsWithSingleValuedOrds++;
                 return resultStrategy.wrapCollector(new LeafBucketCollectorBase(sub, segmentOrds) {
-                    final int[] buffer = new int[4096];
+                    final int[] buffer = context.cardinalityPrefetchPipeline() ? new int[4096] : null;
 
                     @Override
                     public void collect(int doc, long owningBucketOrd) throws IOException {
@@ -579,6 +583,10 @@ public class GlobalOrdinalsStringTermsAggregator extends AbstractStringTermsAggr
 
                     @Override
                     public void collect(DocIdStream stream, long owningBucketOrd) throws IOException {
+                        if (buffer == null) {
+                            super.collect(stream, owningBucketOrd);
+                            return;
+                        }
                         int count = stream.intoArray(buffer);
                         singleValues.prefetchOrdValues(count, buffer);
                         for (int i = 0; i < count; i++) {
