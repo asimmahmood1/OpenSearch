@@ -139,50 +139,7 @@ class AvgAggregator extends NumericMetricsAggregator.SingleValue implements Star
 
         return new LeafBucketCollectorBase(sub, values) {
             private static final int PREFETCH_WINDOW = 262144;
-
-            @Override
-            public void collect(int doc, long bucket) throws IOException {
-                if (values.advanceExact(doc)) {
-                    int valueCount = values.docValueCount();
-                    setKahanSummation(bucket);
-                    counts.increment(bucket, valueCount);
-                    for (int i = 0; i < valueCount; i++) {
-                        kahanSummation.add(values.nextValue());
-                    }
-                    sums.set(bucket, kahanSummation.value());
-                    compensations.set(bucket, kahanSummation.delta());
-                }
-            }
-
-            @Override
-            public void collect(DocIdStream stream, long bucket) throws IOException {
-                setKahanSummation(bucket);
-                final int[] count = { 0 };
-                final boolean[] prefetched = { false };
-                stream.forEach((doc) -> {
-                    if (!prefetched[0] && rawValues != null) {
-                        prefetched[0] = true;
-                        rawValues.prefetchRange(doc, PREFETCH_WINDOW);
-                    }
-                    if (values.advanceExact(doc)) {
-                        int valueCount = values.docValueCount();
-                        count[0] += valueCount;
-                        for (int i = 0; i < valueCount; i++) {
-                            kahanSummation.add(values.nextValue());
-                        }
-                    }
-                });
-                counts.increment(bucket, count[0]);
-                sums.set(bucket, kahanSummation.value());
-                compensations.set(bucket, kahanSummation.delta());
-            }
-
-            @Override
-            public void collectRange(int min, int max) throws IOException {
-                setKahanSummation(0);
-                int count = 0;
-                if (rawValues != null) {
-                    rawValues.prefetchRange(min, max - min);
+                    rawValues.prefetchRange(max, max - min);
                 }
                 for (int docId = min; docId < max; docId++) {
                     if (values.advanceExact(docId)) {

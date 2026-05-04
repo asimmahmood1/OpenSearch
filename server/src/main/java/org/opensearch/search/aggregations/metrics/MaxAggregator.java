@@ -160,41 +160,7 @@ class MaxAggregator extends NumericMetricsAggregator.SingleValue implements Star
         final SortedNumericDocValues rawValues = context.cardinalityPrefetchPipeline() ? valuesSource.longValues(ctx) : null;
         return new LeafBucketCollectorBase(sub, allValues) {
             private static final int PREFETCH_WINDOW = 262144;
-
-            @Override
-            public void collect(int doc, long bucket) throws IOException {
-                growMaxes(bucket);
-                if (values.advanceExact(doc)) {
-                    final double value = values.doubleValue();
-                    double max = maxes.get(bucket);
-                    max = Math.max(max, value);
-                    maxes.set(bucket, max);
-                }
-            }
-
-            @Override
-            public void collect(DocIdStream stream, long bucket) throws IOException {
-                growMaxes(bucket);
-                final double[] maxArr = { maxes.get(bucket) };
-                final boolean[] prefetched = { false };
-                stream.forEach((doc) -> {
-                    if (!prefetched[0] && rawValues != null) {
-                        prefetched[0] = true;
-                        rawValues.prefetchRange(doc, PREFETCH_WINDOW);
-                    }
-                    if (values.advanceExact(doc)) {
-                        maxArr[0] = Math.max(maxArr[0], values.doubleValue());
-                    }
-                });
-                maxes.set(bucket, maxArr[0]);
-            }
-
-            @Override
-            public void collectRange(int min, int max) throws IOException {
-                growMaxes(0);
-                double maximum = maxes.get(0);
-                if (rawValues != null) {
-                    rawValues.prefetchRange(min, max - min);
+                    rawValues.prefetchRange(max, max - min);
                 }
                 for (int doc = min; doc < max; doc++) {
                     if (values.advanceExact(doc)) {

@@ -124,44 +124,7 @@ public class SumAggregator extends NumericMetricsAggregator.SingleValue implemen
         final CompensatedSum kahanSummation = new CompensatedSum(0, 0);
         return new LeafBucketCollectorBase(sub, values) {
             private static final int PREFETCH_WINDOW = 262144;
-
-            @Override
-            public void collect(int doc, long bucket) throws IOException {
-                if (values.advanceExact(doc)) {
-                    setKahanSummation(bucket);
-                    for (int i = 0; i < values.docValueCount(); i++) {
-                        double value = values.nextValue();
-                        kahanSummation.add(value);
-                    }
-                    compensations.set(bucket, kahanSummation.delta());
-                    sums.set(bucket, kahanSummation.value());
-                }
-            }
-
-            @Override
-            public void collect(DocIdStream stream, long bucket) throws IOException {
-                setKahanSummation(bucket);
-                final boolean[] prefetched = { false };
-                stream.forEach((doc) -> {
-                    if (!prefetched[0] && rawValues != null) {
-                        prefetched[0] = true;
-                        rawValues.prefetchRange(doc, PREFETCH_WINDOW);
-                    }
-                    if (values.advanceExact(doc)) {
-                        for (int i = 0; i < values.docValueCount(); i++) {
-                            kahanSummation.add(values.nextValue());
-                        }
-                    }
-                });
-                compensations.set(bucket, kahanSummation.delta());
-                sums.set(bucket, kahanSummation.value());
-            }
-
-            @Override
-            public void collectRange(int min, int max) throws IOException {
-                setKahanSummation(0);
-                if (rawValues != null) {
-                    rawValues.prefetchRange(min, max - min);
+                    rawValues.prefetchRange(max, max - min);
                 }
                 for (int docId = min; docId < max; docId++) {
                     if (values.advanceExact(docId)) {

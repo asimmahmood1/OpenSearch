@@ -108,66 +108,7 @@ class StatsAggregator extends NumericMetricsAggregator.MultiValue {
 
         return new LeafBucketCollectorBase(sub, values) {
             private static final int PREFETCH_WINDOW = 262144;
-
-            @Override
-            public void collect(int doc, long bucket) throws IOException {
-                growStats(bucket);
-
-                if (values.advanceExact(doc)) {
-                    final int valuesCount = values.docValueCount();
-                    counts.increment(bucket, valuesCount);
-                    double min = mins.get(bucket);
-                    double max = maxes.get(bucket);
-
-                    for (int i = 0; i < valuesCount; i++) {
-                        double value = values.nextValue();
-                        kahanSummation.add(value);
-                        min = Math.min(min, value);
-                        max = Math.max(max, value);
-                    }
-                    sums.set(bucket, kahanSummation.value());
-                    compensations.set(bucket, kahanSummation.delta());
-                    mins.set(bucket, min);
-                    maxes.set(bucket, max);
-                }
-            }
-
-            @Override
-            public void collect(DocIdStream stream, long bucket) throws IOException {
-                growStats(bucket);
-                final double[] minArr = { mins.get(bucket) };
-                final double[] maxArr = { maxes.get(bucket) };
-                final boolean[] prefetched = { false };
-                stream.forEach((doc) -> {
-                    if (!prefetched[0] && rawValues != null) {
-                        prefetched[0] = true;
-                        rawValues.prefetchRange(doc, PREFETCH_WINDOW);
-                    }
-                    if (values.advanceExact(doc)) {
-                        final int valuesCount = values.docValueCount();
-                        counts.increment(bucket, valuesCount);
-                        for (int i = 0; i < valuesCount; i++) {
-                            double value = values.nextValue();
-                            kahanSummation.add(value);
-                            minArr[0] = Math.min(minArr[0], value);
-                            maxArr[0] = Math.max(maxArr[0], value);
-                        }
-                    }
-                });
-                sums.set(bucket, kahanSummation.value());
-                compensations.set(bucket, kahanSummation.delta());
-                mins.set(bucket, minArr[0]);
-                maxes.set(bucket, maxArr[0]);
-            }
-
-            @Override
-            public void collectRange(int min, int max) throws IOException {
-                growStats(0);
-
-                double minimum = mins.get(0);
-                double maximum = maxes.get(0);
-                if (rawValues != null) {
-                    rawValues.prefetchRange(min, max - min);
+                    rawValues.prefetchRange(max, max - min);
                 }
                 for (int doc = min; doc < max; doc++) {
                     if (values.advanceExact(doc)) {
