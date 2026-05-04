@@ -31,7 +31,10 @@
 
 package org.opensearch.search.aggregations.metrics;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.DocIdStream;
 import org.apache.lucene.search.ScoreMode;
@@ -71,6 +74,8 @@ import static org.opensearch.search.startree.StarTreeQueryHelper.getSupportedSta
  * @opensearch.internal
  */
 class AvgAggregator extends NumericMetricsAggregator.SingleValue implements StarTreePreComputeCollector {
+
+    private static final Logger logger = LogManager.getLogger(AvgAggregator.class);
 
     final ValuesSource.Numeric valuesSource;
 
@@ -129,9 +134,12 @@ class AvgAggregator extends NumericMetricsAggregator.SingleValue implements Star
 
         final BigArrays bigArrays = context.bigArrays();
         final SortedNumericDoubleValues values = valuesSource.doubleValues(ctx);
+        final SortedNumericDocValues rawValues = context.cardinalityPrefetchPipeline() ? valuesSource.longValues(ctx) : null;
         final CompensatedSum kahanSummation = new CompensatedSum(0, 0);
 
         return new LeafBucketCollectorBase(sub, values) {
+            private static final int PREFETCH_WINDOW = 262144;
+
             @Override
             public void collect(int doc, long bucket) throws IOException {
                 if (values.advanceExact(doc)) {
@@ -139,8 +147,7 @@ class AvgAggregator extends NumericMetricsAggregator.SingleValue implements Star
                     setKahanSummation(bucket);
                     counts.increment(bucket, valueCount);
                     for (int i = 0; i < valueCount; i++) {
-                        double value = values.nextValue();
-                        kahanSummation.add(value);
+                        kahanSummation.add(values.nextValue());
                     }
                     sums.set(bucket, kahanSummation.value());
                     compensations.set(bucket, kahanSummation.delta());
@@ -151,7 +158,12 @@ class AvgAggregator extends NumericMetricsAggregator.SingleValue implements Star
             public void collect(DocIdStream stream, long bucket) throws IOException {
                 setKahanSummation(bucket);
                 final int[] count = { 0 };
+                final boolean[] prefetched = { false };
                 stream.forEach((doc) -> {
+                    if (!prefetched[0] && rawValues != null) {
+                        prefetched[0] = true;
+                        rawValues.prefetchRange(doc, PREFETCH_WINDOW);
+                    }
                     if (values.advanceExact(doc)) {
                         int valueCount = values.docValueCount();
                         count[0] += valueCount;
@@ -169,6 +181,9 @@ class AvgAggregator extends NumericMetricsAggregator.SingleValue implements Star
             public void collectRange(int min, int max) throws IOException {
                 setKahanSummation(0);
                 int count = 0;
+                if (rawValues != null) {
+                    rawValues.prefetchRange(min, max - min);
+                }
                 for (int docId = min; docId < max; docId++) {
                     if (values.advanceExact(docId)) {
                         int valueCount = values.docValueCount();

@@ -34,6 +34,7 @@ package org.opensearch.search.aggregations.metrics;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.PointValues;
+import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.search.CollectionTerminatedException;
 import org.apache.lucene.search.DocIdStream;
 import org.apache.lucene.search.ScoreMode;
@@ -156,7 +157,10 @@ class MaxAggregator extends NumericMetricsAggregator.SingleValue implements Star
         final BigArrays bigArrays = context.bigArrays();
         final SortedNumericDoubleValues allValues = valuesSource.doubleValues(ctx);
         final NumericDoubleValues values = MultiValueMode.MAX.select(allValues);
+        final SortedNumericDocValues rawValues = context.cardinalityPrefetchPipeline() ? valuesSource.longValues(ctx) : null;
         return new LeafBucketCollectorBase(sub, allValues) {
+            private static final int PREFETCH_WINDOW = 262144;
+
             @Override
             public void collect(int doc, long bucket) throws IOException {
                 growMaxes(bucket);
@@ -171,19 +175,27 @@ class MaxAggregator extends NumericMetricsAggregator.SingleValue implements Star
             @Override
             public void collect(DocIdStream stream, long bucket) throws IOException {
                 growMaxes(bucket);
-                final double[] max = { maxes.get(bucket) };
+                final double[] maxArr = { maxes.get(bucket) };
+                final boolean[] prefetched = { false };
                 stream.forEach((doc) -> {
+                    if (!prefetched[0] && rawValues != null) {
+                        prefetched[0] = true;
+                        rawValues.prefetchRange(doc, PREFETCH_WINDOW);
+                    }
                     if (values.advanceExact(doc)) {
-                        max[0] = Math.max(max[0], values.doubleValue());
+                        maxArr[0] = Math.max(maxArr[0], values.doubleValue());
                     }
                 });
-                maxes.set(bucket, max[0]);
+                maxes.set(bucket, maxArr[0]);
             }
 
             @Override
             public void collectRange(int min, int max) throws IOException {
                 growMaxes(0);
                 double maximum = maxes.get(0);
+                if (rawValues != null) {
+                    rawValues.prefetchRange(min, max - min);
+                }
                 for (int doc = min; doc < max; doc++) {
                     if (values.advanceExact(doc)) {
                         maximum = Math.max(maximum, values.doubleValue());

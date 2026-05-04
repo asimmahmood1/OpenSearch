@@ -32,6 +32,7 @@
 package org.opensearch.search.aggregations.metrics;
 
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.search.DocIdStream;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.util.NumericUtils;
@@ -119,8 +120,11 @@ public class SumAggregator extends NumericMetricsAggregator.SingleValue implemen
         }
         final BigArrays bigArrays = context.bigArrays();
         final SortedNumericDoubleValues values = valuesSource.doubleValues(ctx);
+        final SortedNumericDocValues rawValues = context.cardinalityPrefetchPipeline() ? valuesSource.longValues(ctx) : null;
         final CompensatedSum kahanSummation = new CompensatedSum(0, 0);
         return new LeafBucketCollectorBase(sub, values) {
+            private static final int PREFETCH_WINDOW = 262144;
+
             @Override
             public void collect(int doc, long bucket) throws IOException {
                 if (values.advanceExact(doc)) {
@@ -137,7 +141,12 @@ public class SumAggregator extends NumericMetricsAggregator.SingleValue implemen
             @Override
             public void collect(DocIdStream stream, long bucket) throws IOException {
                 setKahanSummation(bucket);
+                final boolean[] prefetched = { false };
                 stream.forEach((doc) -> {
+                    if (!prefetched[0] && rawValues != null) {
+                        prefetched[0] = true;
+                        rawValues.prefetchRange(doc, PREFETCH_WINDOW);
+                    }
                     if (values.advanceExact(doc)) {
                         for (int i = 0; i < values.docValueCount(); i++) {
                             kahanSummation.add(values.nextValue());
@@ -151,6 +160,9 @@ public class SumAggregator extends NumericMetricsAggregator.SingleValue implemen
             @Override
             public void collectRange(int min, int max) throws IOException {
                 setKahanSummation(0);
+                if (rawValues != null) {
+                    rawValues.prefetchRange(min, max - min);
+                }
                 for (int docId = min; docId < max; docId++) {
                     if (values.advanceExact(docId)) {
                         for (int i = 0; i < values.docValueCount(); i++) {

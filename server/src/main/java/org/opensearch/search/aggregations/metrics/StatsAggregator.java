@@ -32,6 +32,7 @@
 package org.opensearch.search.aggregations.metrics;
 
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.search.DocIdStream;
 import org.apache.lucene.search.ScoreMode;
 import org.opensearch.common.lease.Releasables;
@@ -102,9 +103,12 @@ class StatsAggregator extends NumericMetricsAggregator.MultiValue {
         }
         final BigArrays bigArrays = context.bigArrays();
         final SortedNumericDoubleValues values = valuesSource.doubleValues(ctx);
+        final SortedNumericDocValues rawValues = context.cardinalityPrefetchPipeline() ? valuesSource.longValues(ctx) : null;
         final CompensatedSum kahanSummation = new CompensatedSum(0, 0);
 
         return new LeafBucketCollectorBase(sub, values) {
+            private static final int PREFETCH_WINDOW = 262144;
+
             @Override
             public void collect(int doc, long bucket) throws IOException {
                 growStats(bucket);
@@ -131,26 +135,29 @@ class StatsAggregator extends NumericMetricsAggregator.MultiValue {
             @Override
             public void collect(DocIdStream stream, long bucket) throws IOException {
                 growStats(bucket);
-
-                double[] min = { mins.get(bucket) };
-                double[] max = { maxes.get(bucket) };
+                final double[] minArr = { mins.get(bucket) };
+                final double[] maxArr = { maxes.get(bucket) };
+                final boolean[] prefetched = { false };
                 stream.forEach((doc) -> {
+                    if (!prefetched[0] && rawValues != null) {
+                        prefetched[0] = true;
+                        rawValues.prefetchRange(doc, PREFETCH_WINDOW);
+                    }
                     if (values.advanceExact(doc)) {
                         final int valuesCount = values.docValueCount();
                         counts.increment(bucket, valuesCount);
-
                         for (int i = 0; i < valuesCount; i++) {
                             double value = values.nextValue();
                             kahanSummation.add(value);
-                            min[0] = Math.min(min[0], value);
-                            max[0] = Math.max(max[0], value);
+                            minArr[0] = Math.min(minArr[0], value);
+                            maxArr[0] = Math.max(maxArr[0], value);
                         }
                     }
                 });
                 sums.set(bucket, kahanSummation.value());
                 compensations.set(bucket, kahanSummation.delta());
-                mins.set(bucket, min[0]);
-                maxes.set(bucket, max[0]);
+                mins.set(bucket, minArr[0]);
+                maxes.set(bucket, maxArr[0]);
             }
 
             @Override
@@ -159,11 +166,13 @@ class StatsAggregator extends NumericMetricsAggregator.MultiValue {
 
                 double minimum = mins.get(0);
                 double maximum = maxes.get(0);
-                for (int doc = min; doc < maximum; doc++) {
+                if (rawValues != null) {
+                    rawValues.prefetchRange(min, max - min);
+                }
+                for (int doc = min; doc < max; doc++) {
                     if (values.advanceExact(doc)) {
                         final int valuesCount = values.docValueCount();
                         counts.increment(0, valuesCount);
-
                         for (int i = 0; i < valuesCount; i++) {
                             double value = values.nextValue();
                             kahanSummation.add(value);
