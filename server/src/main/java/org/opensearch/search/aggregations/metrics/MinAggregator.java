@@ -158,8 +158,53 @@ class MinAggregator extends NumericMetricsAggregator.SingleValue implements Star
         final SortedNumericDoubleValues allValues = valuesSource.doubleValues(ctx);
         final NumericDoubleValues values = MultiValueMode.MIN.select(allValues);
         final SortedNumericDocValues rawValues = context.cardinalityPrefetchPipeline() ? valuesSource.longValues(ctx) : null;
+        // Prefetch NEXT segment's DV blocks (gives ~1s lead time while current segment collects)
+        if (rawValues != null) {
+            rawValues.prefetchRange(0, ctx.reader().maxDoc());
+            prefetchNextSegment(ctx, valuesSource);
+        }
         return new LeafBucketCollectorBase(sub, allValues) {
             private static final int PREFETCH_WINDOW = 262144;
+            private static final int BATCH_SIZE = 4096;
+            private int bufPos = 0;
+
+            @Override
+            public void collect(int doc, long bucket) throws IOException {
+                if (rawValues != null && ++bufPos >= BATCH_SIZE) {
+                    bufPos = 0;
+                    rawValues.prefetchRange(doc + PREFETCH_WINDOW, PREFETCH_WINDOW);
+                }
+                growMins(bucket);
+                if (values.advanceExact(doc)) {
+                    final double value = values.doubleValue();
+                    double min = mins.get(bucket);
+                    min = Math.min(min, value);
+                    mins.set(bucket, min);
+                }
+            }
+
+            @Override
+            public void collect(DocIdStream stream, long bucket) throws IOException {
+                growMins(bucket);
+                final double[] minArr = { mins.get(bucket) };
+                final boolean[] prefetched = { false };
+                stream.forEach((doc) -> {
+                    if (!prefetched[0] && rawValues != null) {
+                        prefetched[0] = true;
+                        rawValues.prefetchRange(doc, PREFETCH_WINDOW);
+                    }
+                    if (values.advanceExact(doc)) {
+                        minArr[0] = Math.min(minArr[0], values.doubleValue());
+                    }
+                });
+                mins.set(bucket, minArr[0]);
+            }
+
+            @Override
+            public void collectRange(int min, int max) throws IOException {
+                growMins(0);
+                double minimum = mins.get(0);
+                if (rawValues != null) {
                     rawValues.prefetchRange(max, max - min);
                 }
                 for (int doc = min; doc < max; doc++) {
@@ -289,4 +334,22 @@ class MinAggregator extends NumericMetricsAggregator.SingleValue implements Star
     public StreamingCostMetrics getStreamingCostMetrics() {
         return new StreamingCostMetrics(true, 1, 1, 1, 1);
     }
+
+    /**
+     * Prefetch the NEXT segment's DV blocks so they're loaded while we collect the current segment.
+     */
+    private void prefetchNextSegment(LeafReaderContext ctx, ValuesSource.Numeric valuesSource) {
+        try {
+            java.util.List<LeafReaderContext> leaves = context.searcher().getIndexReader().leaves();
+            int nextOrd = ctx.ord + 1;
+            if (nextOrd < leaves.size()) {
+                LeafReaderContext nextCtx = leaves.get(nextOrd);
+                org.apache.lucene.index.SortedNumericDocValues nextValues = valuesSource.longValues(nextCtx);
+                nextValues.prefetchRange(0, nextCtx.reader().maxDoc());
+            }
+        } catch (Exception e) {
+            // Best-effort prefetch
+        }
+    }
+
 }

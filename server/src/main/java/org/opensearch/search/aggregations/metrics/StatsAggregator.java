@@ -104,10 +104,80 @@ class StatsAggregator extends NumericMetricsAggregator.MultiValue {
         final BigArrays bigArrays = context.bigArrays();
         final SortedNumericDoubleValues values = valuesSource.doubleValues(ctx);
         final SortedNumericDocValues rawValues = context.cardinalityPrefetchPipeline() ? valuesSource.longValues(ctx) : null;
+        // Prefetch NEXT segment's DV blocks (gives ~1s lead time while current segment collects)
+        if (rawValues != null) {
+            rawValues.prefetchRange(0, ctx.reader().maxDoc());
+            prefetchNextSegment(ctx, valuesSource);
+        }
         final CompensatedSum kahanSummation = new CompensatedSum(0, 0);
 
         return new LeafBucketCollectorBase(sub, values) {
             private static final int PREFETCH_WINDOW = 262144;
+            private static final int BATCH_SIZE = 4096;
+            private int bufPos = 0;
+
+            @Override
+            public void collect(int doc, long bucket) throws IOException {
+                if (rawValues != null && ++bufPos >= BATCH_SIZE) {
+                    bufPos = 0;
+                    rawValues.prefetchRange(doc + PREFETCH_WINDOW, PREFETCH_WINDOW);
+                }
+                growStats(bucket);
+
+                if (values.advanceExact(doc)) {
+                    final int valuesCount = values.docValueCount();
+                    counts.increment(bucket, valuesCount);
+                    double min = mins.get(bucket);
+                    double max = maxes.get(bucket);
+
+                    for (int i = 0; i < valuesCount; i++) {
+                        double value = values.nextValue();
+                        kahanSummation.add(value);
+                        min = Math.min(min, value);
+                        max = Math.max(max, value);
+                    }
+                    sums.set(bucket, kahanSummation.value());
+                    compensations.set(bucket, kahanSummation.delta());
+                    mins.set(bucket, min);
+                    maxes.set(bucket, max);
+                }
+            }
+
+            @Override
+            public void collect(DocIdStream stream, long bucket) throws IOException {
+                growStats(bucket);
+                final double[] minArr = { mins.get(bucket) };
+                final double[] maxArr = { maxes.get(bucket) };
+                final boolean[] prefetched = { false };
+                stream.forEach((doc) -> {
+                    if (!prefetched[0] && rawValues != null) {
+                        prefetched[0] = true;
+                        rawValues.prefetchRange(doc, PREFETCH_WINDOW);
+                    }
+                    if (values.advanceExact(doc)) {
+                        final int valuesCount = values.docValueCount();
+                        counts.increment(bucket, valuesCount);
+                        for (int i = 0; i < valuesCount; i++) {
+                            double value = values.nextValue();
+                            kahanSummation.add(value);
+                            minArr[0] = Math.min(minArr[0], value);
+                            maxArr[0] = Math.max(maxArr[0], value);
+                        }
+                    }
+                });
+                sums.set(bucket, kahanSummation.value());
+                compensations.set(bucket, kahanSummation.delta());
+                mins.set(bucket, minArr[0]);
+                maxes.set(bucket, maxArr[0]);
+            }
+
+            @Override
+            public void collectRange(int min, int max) throws IOException {
+                growStats(0);
+
+                double minimum = mins.get(0);
+                double maximum = maxes.get(0);
+                if (rawValues != null) {
                     rawValues.prefetchRange(max, max - min);
                 }
                 for (int doc = min; doc < max; doc++) {
@@ -211,4 +281,22 @@ class StatsAggregator extends NumericMetricsAggregator.MultiValue {
     public void doClose() {
         Releasables.close(counts, maxes, mins, sums, compensations);
     }
+
+    /**
+     * Prefetch the NEXT segment's DV blocks so they're loaded while we collect the current segment.
+     */
+    private void prefetchNextSegment(LeafReaderContext ctx, ValuesSource.Numeric valuesSource) {
+        try {
+            java.util.List<LeafReaderContext> leaves = context.searcher().getIndexReader().leaves();
+            int nextOrd = ctx.ord + 1;
+            if (nextOrd < leaves.size()) {
+                LeafReaderContext nextCtx = leaves.get(nextOrd);
+                org.apache.lucene.index.SortedNumericDocValues nextValues = valuesSource.longValues(nextCtx);
+                nextValues.prefetchRange(0, nextCtx.reader().maxDoc());
+            }
+        } catch (Exception e) {
+            // Best-effort prefetch
+        }
+    }
+
 }
