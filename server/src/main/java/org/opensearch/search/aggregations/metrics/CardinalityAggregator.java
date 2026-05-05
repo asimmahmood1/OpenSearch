@@ -34,7 +34,9 @@ package org.opensearch.search.aggregations.metrics;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.index.Term;
@@ -44,6 +46,7 @@ import org.apache.lucene.search.CollectionTerminatedException;
 import org.apache.lucene.search.DisiPriorityQueue;
 import org.apache.lucene.search.DisiWrapper;
 import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.DocIdStream;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.TermQuery;
@@ -142,7 +145,7 @@ public class CardinalityAggregator extends NumericMetricsAggregator.SingleValue 
                 ? MurmurHash3Values.hash(source.doubleValues(ctx))
                 : MurmurHash3Values.hash(source.longValues(ctx));
             numericCollectorsUsed++;
-            return new DirectCollector(counts, hashValues);
+            return new DirectCollector(counts, hashValues, context.cardinalityPrefetchPipeline());
         }
 
         Collector collector = null;
@@ -154,7 +157,7 @@ public class CardinalityAggregator extends NumericMetricsAggregator.SingleValue 
                 return new EmptyCollector();
             } else if (executionMode == CardinalityAggregatorFactory.ExecutionMode.ORDINALS) { // Force OrdinalsCollector
                 ordinalsCollectorsUsed++;
-                collector = new OrdinalsCollector(counts, ordinalValues, context.bigArrays());
+                collector = new OrdinalsCollector(counts, ordinalValues, context.bigArrays(), context.cardinalityPrefetchPipeline());
             } else if (executionMode == null) {
                 // no hint provided, fall back to heuristics
                 final long ordinalsMemoryUsage = OrdinalsCollector.memoryOverhead(maxOrd);
@@ -162,7 +165,7 @@ public class CardinalityAggregator extends NumericMetricsAggregator.SingleValue 
                 // only use ordinals if they don't increase memory usage by more than 25%
                 if (ordinalsMemoryUsage < countsMemoryUsage / 4) {
                     ordinalsCollectorsUsed++;
-                    collector = new OrdinalsCollector(counts, ordinalValues, context.bigArrays());
+                    collector = new OrdinalsCollector(counts, ordinalValues, context.bigArrays(), context.cardinalityPrefetchPipeline());
                 } else {
                     ordinalsCollectorsOverheadTooHigh++;
                 }
@@ -171,7 +174,7 @@ public class CardinalityAggregator extends NumericMetricsAggregator.SingleValue 
 
         if (collector == null) { // not able to build an OrdinalsCollector, or hint is direct
             stringHashingCollectorsUsed++;
-            collector = new DirectCollector(counts, MurmurHash3Values.hash(valuesSource.bytesValues(ctx)));
+            collector = new DirectCollector(counts, MurmurHash3Values.hash(valuesSource.bytesValues(ctx)), context.cardinalityPrefetchPipeline());
         }
 
         if (canPrune(parent, subAggregators, valuesSourceConfig)) {
@@ -513,12 +516,29 @@ public class CardinalityAggregator extends NumericMetricsAggregator.SingleValue 
      */
     static class DirectCollector extends Collector {
 
+        private static final int BATCH_SIZE = 4096;
+        private static final int PIPELINE_DEPTH = 4; // prefetch this many batches ahead
+
         private final MurmurHash3Values hashes;
         private final HyperLogLogPlusPlus counts;
+        private final boolean prefetchPipeline;
+        private final int[] docBuffer;
+        // Ring buffer: each slot holds a batch of doc IDs and its count
+        private final int[][] ring;
+        private final int[] ringCounts;
 
-        DirectCollector(HyperLogLogPlusPlus counts, MurmurHash3Values values) {
+        DirectCollector(HyperLogLogPlusPlus counts, MurmurHash3Values values, boolean prefetchPipeline) {
             this.counts = counts;
             this.hashes = values;
+            this.prefetchPipeline = prefetchPipeline;
+            this.docBuffer = new int[BATCH_SIZE];
+            if (prefetchPipeline) {
+                this.ring = new int[PIPELINE_DEPTH][BATCH_SIZE];
+                this.ringCounts = new int[PIPELINE_DEPTH];
+            } else {
+                this.ring = null;
+                this.ringCounts = null;
+            }
         }
 
         @Override
@@ -528,6 +548,74 @@ public class CardinalityAggregator extends NumericMetricsAggregator.SingleValue 
                 for (int i = 0; i < valueCount; ++i) {
                     counts.collect(bucketOrd, hashes.nextValue());
                 }
+            }
+        }
+
+        @Override
+        public void collect(DocIdStream stream, long bucketOrd) throws IOException {
+            if (prefetchPipeline) {
+                collectWithPrefetchPipeline(stream, bucketOrd);
+            } else {
+                collectSimple(stream, bucketOrd);
+            }
+        }
+
+        private void collectSimple(DocIdStream stream, long bucketOrd) throws IOException {
+            for (int count = stream.intoArray(docBuffer); count > 0; count = stream.intoArray(docBuffer)) {
+                for (int i = 0; i < count; i++) {
+                    if (hashes.advanceExact(docBuffer[i])) {
+                        final int valueCount = hashes.count();
+                        for (int v = 0; v < valueCount; ++v) {
+                            counts.collect(bucketOrd, hashes.nextValue());
+                        }
+                    }
+                }
+            }
+        }
+
+        private void collectWithPrefetchPipeline(DocIdStream stream, long bucketOrd) throws IOException {
+            // Fill the ring buffer: read up to PIPELINE_DEPTH batches and prefetch all of them
+            int filled = 0;
+            for (int slot = 0; slot < PIPELINE_DEPTH; slot++) {
+                int n = stream.intoArray(ring[slot]);
+                ringCounts[slot] = n;
+                if (n > 0) {
+                    hashes.prefetchRange(ring[slot], n);
+                    filled++;
+                }
+                if (n == 0 || !stream.mayHaveRemaining()) break;
+            }
+            if (filled == 0) return;
+
+            // Process ring: collect slot 0, refill it with new batch, advance
+            int head = 0;
+            while (ringCounts[head] > 0) {
+                int count = ringCounts[head];
+                int[] batch = ring[head];
+
+                // Collect this batch (prefetch was issued PIPELINE_DEPTH batches ago)
+                for (int i = 0; i < count; i++) {
+                    if (hashes.advanceExact(batch[i])) {
+                        final int valueCount = hashes.count();
+                        for (int v = 0; v < valueCount; ++v) {
+                            counts.collect(bucketOrd, hashes.nextValue());
+                        }
+                    }
+                }
+
+                // Refill this slot with a new batch and prefetch it
+                if (stream.mayHaveRemaining()) {
+                    int n = stream.intoArray(batch);
+                    ringCounts[head] = n;
+                    if (n > 0) {
+                        hashes.prefetchRange(batch, n);
+                    }
+                } else {
+                    ringCounts[head] = 0;
+                }
+
+                // Advance to next slot
+                head = (head + 1) % PIPELINE_DEPTH;
             }
         }
 
@@ -551,6 +639,7 @@ public class CardinalityAggregator extends NumericMetricsAggregator.SingleValue 
     static class OrdinalsCollector extends Collector {
 
         private static final long SHALLOW_FIXEDBITSET_SIZE = RamUsageEstimator.shallowSizeOfInstance(FixedBitSet.class);
+        private static final int BATCH_SIZE = 4096;
 
         /**
          * Return an approximate memory overhead per bucket for this collector.
@@ -561,11 +650,16 @@ public class CardinalityAggregator extends NumericMetricsAggregator.SingleValue 
 
         private final BigArrays bigArrays;
         private final SortedSetDocValues values;
+        private final SortedDocValues singleValues;
         private final int maxOrd;
         private final HyperLogLogPlusPlus counts;
         private ObjectArray<BitArray> visitedOrds;
+        private final int[] docBuffer;
+        private final int[] prefetchBuffer;
+        private final int[] ordBuffer;
+        private final boolean prefetchPipeline;
 
-        OrdinalsCollector(HyperLogLogPlusPlus counts, SortedSetDocValues values, BigArrays bigArrays) {
+        OrdinalsCollector(HyperLogLogPlusPlus counts, SortedSetDocValues values, BigArrays bigArrays, boolean prefetchPipeline) {
             if (values.getValueCount() > Integer.MAX_VALUE) {
                 throw new IllegalArgumentException();
             }
@@ -573,6 +667,11 @@ public class CardinalityAggregator extends NumericMetricsAggregator.SingleValue 
             this.bigArrays = bigArrays;
             this.counts = counts;
             this.values = values;
+            this.singleValues = DocValues.unwrapSingleton(values);
+            this.docBuffer = new int[BATCH_SIZE];
+            this.prefetchBuffer = prefetchPipeline ? new int[BATCH_SIZE] : null;
+            this.ordBuffer = (singleValues != null) ? new int[BATCH_SIZE] : null;
+            this.prefetchPipeline = prefetchPipeline;
             visitedOrds = bigArrays.newObjectArray(1);
         }
 
@@ -590,6 +689,85 @@ public class CardinalityAggregator extends NumericMetricsAggregator.SingleValue 
                 while ((count-- > 0) && (ord = values.nextOrd()) != SortedSetDocValues.NO_MORE_DOCS) {
                     bits.set((int) ord);
                 }
+            }
+        }
+
+        @Override
+        public void collect(DocIdStream stream, long bucketOrd) throws IOException {
+            visitedOrds = bigArrays.grow(visitedOrds, bucketOrd + 1);
+            BitArray bits = visitedOrds.get(bucketOrd);
+            if (bits == null) {
+                bits = new BitArray(maxOrd, bigArrays);
+                visitedOrds.set(bucketOrd, bits);
+            }
+            if (singleValues != null) {
+                collectSingleValued(stream, bits);
+            } else {
+                collectMultiValued(stream, bits);
+            }
+        }
+
+        private void collectSingleValued(DocIdStream stream, BitArray bits) throws IOException {
+            if (prefetchPipeline == false) {
+                for (int count = stream.intoArray(docBuffer); count > 0; count = stream.intoArray(docBuffer)) {
+                    singleValues.ordValues(count, docBuffer, ordBuffer, -1);
+                    for (int i = 0; i < count; i++) {
+                        if (ordBuffer[i] != -1) {
+                            bits.set(ordBuffer[i]);
+                        }
+                    }
+                    if (stream.mayHaveRemaining() == false) break;
+                }
+                return;
+            }
+
+            // Pipelined: prefetch batch N+1 while processing batch N
+            int[] current = docBuffer;
+            int[] next = prefetchBuffer;
+            int count = stream.intoArray(current);
+            if (count <= 0) return;
+            singleValues.prefetchOrdValues(count, current);
+
+            while (true) {
+                // Fill next batch and start its prefetch while we process current
+                int nextCount = stream.mayHaveRemaining() ? stream.intoArray(next) : 0;
+                if (nextCount > 0) {
+                    singleValues.prefetchOrdValues(nextCount, next);
+                }
+
+                // Process current batch (IO was prefetched)
+                singleValues.ordValues(count, current, ordBuffer, -1);
+                for (int i = 0; i < count; i++) {
+                    if (ordBuffer[i] != -1) {
+                        bits.set(ordBuffer[i]);
+                    }
+                }
+
+                if (nextCount <= 0) break;
+
+                // Swap buffers
+                int[] tmp = current;
+                current = next;
+                next = tmp;
+                count = nextCount;
+            }
+        }
+
+        private void collectMultiValued(DocIdStream stream, BitArray bits) throws IOException {
+            for (int count = stream.intoArray(docBuffer); count > 0; count = stream.intoArray(docBuffer)) {
+                if (prefetchPipeline) {
+                    values.prefetchOrds(docBuffer, count);
+                }
+                for (int i = 0; i < count; i++) {
+                    if (values.advanceExact(docBuffer[i])) {
+                        int docValueCount = values.docValueCount();
+                        long ord;
+                        while ((docValueCount-- > 0) && (ord = values.nextOrd()) != SortedSetDocValues.NO_MORE_DOCS) {
+                            bits.set((int) ord);
+                        }
+                    }
+                }
+                if (stream.mayHaveRemaining() == false) break;
             }
         }
 
@@ -649,6 +827,9 @@ public class CardinalityAggregator extends NumericMetricsAggregator.SingleValue 
 
         public abstract long nextValue() throws IOException;
 
+        /** Prefetch doc values for the given doc IDs. Default is no-op. */
+        public void prefetchRange(int[] docIds, int count) throws IOException {}
+
         /**
          * Return a {@link MurmurHash3Values} instance that computes hashes on the fly for each double value.
          */
@@ -696,6 +877,11 @@ public class CardinalityAggregator extends NumericMetricsAggregator.SingleValue 
             @Override
             public long nextValue() throws IOException {
                 return BitMixer.mix64(values.nextValue());
+            }
+
+            @Override
+            public void prefetchRange(int[] docIds, int count) throws IOException {
+                values.prefetchRange(docIds, count);
             }
         }
 

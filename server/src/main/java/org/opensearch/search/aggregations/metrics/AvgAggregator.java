@@ -31,8 +31,12 @@
 
 package org.opensearch.search.aggregations.metrics;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.DocIdStream;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.NumericUtils;
@@ -70,6 +74,8 @@ import static org.opensearch.search.startree.StarTreeQueryHelper.getSupportedSta
  * @opensearch.internal
  */
 class AvgAggregator extends NumericMetricsAggregator.SingleValue implements StarTreePreComputeCollector {
+
+    private static final Logger logger = LogManager.getLogger(AvgAggregator.class);
 
     final ValuesSource.Numeric valuesSource;
 
@@ -128,33 +134,91 @@ class AvgAggregator extends NumericMetricsAggregator.SingleValue implements Star
 
         final BigArrays bigArrays = context.bigArrays();
         final SortedNumericDoubleValues values = valuesSource.doubleValues(ctx);
+        final SortedNumericDocValues rawValues = context.cardinalityPrefetchPipeline() ? valuesSource.longValues(ctx) : null;
         final CompensatedSum kahanSummation = new CompensatedSum(0, 0);
+        // Prefetch NEXT segment's DV blocks (gives ~1s lead time while current segment collects)
+        if (rawValues != null) {
+            rawValues.prefetchRange(0, ctx.reader().maxDoc());
+            prefetchNextSegment(ctx, valuesSource);
+        }
 
         return new LeafBucketCollectorBase(sub, values) {
+            private static final int PREFETCH_WINDOW = 262144;
+            private static final int BATCH_SIZE = 4096;
+            private int bufPos = 0;
+
+
             @Override
             public void collect(int doc, long bucket) throws IOException {
-                counts = bigArrays.grow(counts, bucket + 1);
-                sums = bigArrays.grow(sums, bucket + 1);
-                compensations = bigArrays.grow(compensations, bucket + 1);
-
+                if (rawValues != null && ++bufPos >= BATCH_SIZE) {
+                    bufPos = 0;
+                    rawValues.prefetchRange(doc + PREFETCH_WINDOW, PREFETCH_WINDOW);
+                }
                 if (values.advanceExact(doc)) {
-                    final int valueCount = values.docValueCount();
+                    int valueCount = values.docValueCount();
+                    setKahanSummation(bucket);
                     counts.increment(bucket, valueCount);
-                    // Compute the sum of double values with Kahan summation algorithm which is more
-                    // accurate than naive summation.
-                    double sum = sums.get(bucket);
-                    double compensation = compensations.get(bucket);
-
-                    kahanSummation.reset(sum, compensation);
-
                     for (int i = 0; i < valueCount; i++) {
-                        double value = values.nextValue();
-                        kahanSummation.add(value);
+                        kahanSummation.add(values.nextValue());
                     }
-
                     sums.set(bucket, kahanSummation.value());
                     compensations.set(bucket, kahanSummation.delta());
                 }
+            }
+
+            @Override
+            public void collect(DocIdStream stream, long bucket) throws IOException {
+                setKahanSummation(bucket);
+                final int[] count = { 0 };
+                final boolean[] prefetched = { false };
+                stream.forEach((doc) -> {
+                    if (!prefetched[0] && rawValues != null) {
+                        prefetched[0] = true;
+                        rawValues.prefetchRange(doc, PREFETCH_WINDOW);
+                    }
+                    if (values.advanceExact(doc)) {
+                        int valueCount = values.docValueCount();
+                        count[0] += valueCount;
+                        for (int i = 0; i < valueCount; i++) {
+                            kahanSummation.add(values.nextValue());
+                        }
+                    }
+                });
+                counts.increment(bucket, count[0]);
+                sums.set(bucket, kahanSummation.value());
+                compensations.set(bucket, kahanSummation.delta());
+            }
+
+            @Override
+            public void collectRange(int min, int max) throws IOException {
+                setKahanSummation(0);
+                int count = 0;
+                if (rawValues != null) {
+                    rawValues.prefetchRange(max, max - min);
+                }
+                for (int docId = min; docId < max; docId++) {
+                    if (values.advanceExact(docId)) {
+                        int valueCount = values.docValueCount();
+                        count += valueCount;
+                        for (int i = 0; i < valueCount; i++) {
+                            kahanSummation.add(values.nextValue());
+                        }
+                    }
+                }
+                counts.increment(0, count);
+                sums.set(0, kahanSummation.value());
+                compensations.set(0, kahanSummation.delta());
+            }
+
+            private void setKahanSummation(long bucket) {
+                counts = bigArrays.grow(counts, bucket + 1);
+                sums = bigArrays.grow(sums, bucket + 1);
+                compensations = bigArrays.grow(compensations, bucket + 1);
+                // Compute the sum of double values with Kahan summation algorithm which is more
+                // accurate than naive summation.
+                double sum = sums.get(bucket);
+                double compensation = compensations.get(bucket);
+                kahanSummation.reset(sum, compensation);
             }
         };
     }
@@ -275,4 +339,22 @@ class AvgAggregator extends NumericMetricsAggregator.SingleValue implements Star
             }
         };
     }
+
+    /**
+     * Prefetch the NEXT segment's DV blocks so they're loaded while we collect the current segment.
+     */
+    private void prefetchNextSegment(LeafReaderContext ctx, ValuesSource.Numeric valuesSource) {
+        try {
+            java.util.List<LeafReaderContext> leaves = context.searcher().getIndexReader().leaves();
+            int nextOrd = ctx.ord + 1;
+            if (nextOrd < leaves.size()) {
+                LeafReaderContext nextCtx = leaves.get(nextOrd);
+                org.apache.lucene.index.SortedNumericDocValues nextValues = valuesSource.longValues(nextCtx);
+                nextValues.prefetchRange(0, nextCtx.reader().maxDoc());
+            }
+        } catch (Exception e) {
+            // Best-effort prefetch
+        }
+    }
+
 }
